@@ -58,6 +58,11 @@ def add(x: torch.Tensor, y: torch.Tensor):
     add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
     # We return a handle to z but, since `torch.cuda.synchronize()` hasn't been called, the kernel is still
     # running asynchronously at this point.
+
+    # save ptx
+    print(dir(add_kernel.cache))
+    with open("add_kernel.ptx", "w") as a:
+        print(list(add_kernel.cache[0].values())[0].asm["ptx"], file=a)
     return output
 
 
