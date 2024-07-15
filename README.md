@@ -5,6 +5,14 @@ The goal of this repo is to keep my learning process on MLC not only including t
 
 ## Contents
 
-- LLVM: Done
-- Triton: Going on
-- to do...
+### LLVM
+
+Done
+
+### Triton
+
+Going on....
+
+
+
+### to do...
