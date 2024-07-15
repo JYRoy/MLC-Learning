@@ -236,6 +236,7 @@ class LayerNorm(torch.autograd.Function):
         )
         grid = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
         # accumulate partial sums in separate kernel
+        import pdb; pdb.set_trace()
         _layer_norm_bwd_dwdb[grid](
             _dw,
             _db,
