@@ -1,9 +1,9 @@
 <!DOCTYPE html><html><head>
-      <title>00.Triton笔记一：以vector add为例</title>
+      <title>01.Triton笔记一：以vector add为例</title>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
       
-      <link rel="stylesheet" href="file:////root/.vscode-server/extensions/shd101wyy.markdown-preview-enhanced-0.8.13/crossnote/dependencies/katex/katex.min.css">
+      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
       
       
       
@@ -30,7 +30,13 @@
 <ul>
 <li><a href="#overview">Overview</a></li>
 <li><a href="#triton%E5%AE%89%E8%A3%85">Triton安装</a></li>
-<li><a href="#gpu-%E7%BC%96%E7%A8%8B%E7%9A%84%E6%8C%91%E6%88%98">GPU 编程的挑战</a></li>
+<li><a href="#gpu-architecture">GPU Architecture</a></li>
+<li><a href="#volta-v100-sm">Volta V100 SM</a></li>
+<li><a href="#memory-hierachy">Memory Hierachy</a>
+<ul>
+<li><a href="#gpu-%E7%BC%96%E7%A8%8B%E7%9A%84%E4%B8%89%E4%B8%AA%E6%8C%91%E6%88%98">GPU 编程的三个挑战</a></li>
+</ul>
+</li>
 <li><a href="#programming-model">Programming Model</a></li>
 <li><a href="#vector-add-%E4%BE%8B%E5%AD%90">Vector ADD 例子</a>
 <ul>
@@ -61,7 +67,7 @@
 </ul>
 </li>
 <li><a href="#how-does-it-fit-in-a-dnn-stack">How does it fit in a DNN stack?</a></li>
-<li><a href="#how-does-the-compiler-simplify-users-work">How does the compiler simplify user's work?</a></li>
+<li><a href="#how-does-the-compiler-simplify-users-work">How does the compiler simplify user’s work?</a></li>
 <li><a href="#references">References</a></li>
 </ul>
 </li>
@@ -86,7 +92,10 @@
 <p>这些DSL虽然能够作为完成的系统工程应用在非常广泛的模型上，但是它们的性能依然要差于厂商专门优化过的库，下面是Triton论文中给出的2019年时测试的结果，可以看到在矩阵乘的例子上，Triton已经非常接近cublas 10的结果了。</p>
 <p><img src="../.images/Performance%20of%20C%20vs%20Roofline.png" alt="Performance of C vs Roofline.png"></p>
 <p>横轴写的TFLOP/GB的含义不明，姑且认为就是N值，纵轴表示在当前计算量下生成的kernel的在GTX1070上的TFLOPS，roofline则是1070的理论TFLOPS上限。（TFLOPS：teraFLOPS，每秒一万亿 (=10^12) 次的浮点运算）。</p>
-<p>社区中也有非常多的完全基于Triton实现的Python项目，例如：<a href="https://github.com/ModelTC/lightllm/tree/main">LightLLM</a></p>
+<p>社区中也有非常多的完全基于Triton实现的Python项目，例如：<a href="https://github.com/ModelTC/lightllm/tree/main">LightLLM</a>和智源的<a href="https://github.com/FlagOpen/FlagGems">FlagGem</a></p>
+<p>智源目前的工作，利用triton开发多平台的算子库打通不同的芯片生态。</p>
+<p>核心还是利用llvm的多平台+triton的tile基础，来保证兼容性和性能。</p>
+<p><img src="../.images/Triton%20OP%20on%20multi-arch.png" alt="多元生态共建打通编程接口和算子库"></p>
 <h2 id="triton安装">Triton安装 </h2>
 <p>From pips</p>
 <pre data-role="codeBlock" data-info="shell" class="language-shell shell"><code>pip <span class="token function">install</span> triton
@@ -95,11 +104,78 @@
 <span class="token builtin class-name">cd</span> triton/python<span class="token punctuation">;</span>
 pip <span class="token function">install</span> ninja cmake wheel<span class="token punctuation">;</span> <span class="token comment"># build-time dependencies</span>
 pip <span class="token function">install</span> <span class="token parameter variable">-e</span> <span class="token builtin class-name">.</span>
-</code></pre><h2 id="gpu-编程的挑战">GPU 编程的挑战 </h2>
+</code></pre><h2 id="gpu-architecture">GPU Architecture </h2>
+<h2 id="volta-v100-sm">Volta V100 SM </h2>
+<p><img src="../.images/V100%20SM%20Arch.png" alt="V100 SM Arch"></p>
+<p>V100上设计的一个SM中有4个subcore（sub-partation），每个subcore中结构是相同的。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>V100</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32 units</td>
+<td>64</td>
+</tr>
+<tr>
+<td>FP64 units</td>
+<td>32</td>
+</tr>
+<tr>
+<td>INT32 units</td>
+<td>64</td>
+</tr>
+<tr>
+<td>Tensor Cores</td>
+<td>8</td>
+</tr>
+<tr>
+<td>Register File</td>
+<td>256KB</td>
+</tr>
+<tr>
+<td>Unified L1/Shared Memory</td>
+<td>128K</td>
+</tr>
+<tr>
+<td>Active Threads</td>
+<td>2048</td>
+</tr>
+</tbody>
+</table>
+<p>Active Threads和cuda core没有直接关系，我们最多可以放2048个threads到SM上，但是 warp schedule每个时钟周期只能选择4*32个线程去执行。</p>
+<p>SM：</p>
+<ul>
+<li>4个subcore</li>
+<li>L1 instruction cache：4个subcore共享的</li>
+<li>128kb的SRAM：用户可配置为一部分作为L1 Data Cache，另一部分作为Shared Memory使用</li>
+<li>Texture：纹理单元，用于纹理数据的读取和过滤，可以理解为图形学领域的tensor</li>
+</ul>
+<p>subcore：</p>
+<ul>
+<li>L0 Instruction Cache保存接下来执行的指令</li>
+<li>Warp Schedule/Dispatch Unit：俗称前端，选择执行发送给后端执行，一个warp 32个线程为单位</li>
+<li>Register File：寄存器，线程可以直接访问的寄存器数据，32bit为一个寄存器，也可以两个组合在一起成为一个64bit的寄存器</li>
+<li>16个fp32的cuda core、16个int的cuda core、8个fp64的cuda core、2个Tensor core</li>
+<li>Load/Store单元，用于和外部的L1、L2 Cache以及更外部的内存做交互</li>
+<li>Sepical Function Unit：特殊函数做优化的</li>
+</ul>
+<h2 id="memory-hierachy">Memory Hierachy </h2>
+<p><img src="../.images/CUDA%20Memory%20Hierarchy.png" alt="CUDA Memory Hierarchy"></p>
+<p>可以理解为三级的结构：</p>
+<ol>
+<li>片上SM内：Registers、Shared Memory、L1/Tex Cache，片上的延迟比L2低3到5倍</li>
+<li>片上SM共享：L2，所有SM对Global Memory的访问都需要经过L2，L2的带宽是global memory的三倍，延迟低三倍</li>
+<li>片外：Global Memory</li>
+</ol>
+<h3 id="gpu-编程的三个挑战">GPU 编程的三个挑战 </h3>
 <p>现代的GPU架构由三个主要部分构成：</p>
 <ol>
-<li>DRAM：Dynamic Random Access Memory，GPU中的主要内存，通常用作现存；</li>
-<li>SRAM：Static Random Access Memory，价格更加昂贵，但是访问速度更快，所以主要用于存储临时数据和需要频繁访问的数据；</li>
+<li>DRAM：Dynamic Random Access Memory，GPU中的主要内存，通常用作显存；</li>
+<li>SRAM：Static Random Access Memory，价格更加昂贵，但是访问速度更快，所以主要用于存储临时数据和需要频繁访问的数据，L1/2 Cache；</li>
 <li>ALUs：Arithmetic Logic Units，算术逻辑单元，负责执行算术运算（如加法、减法、乘法等）和逻辑运算（如与、或、非等）；</li>
 </ol>
 <p><img src="../.images/Basic%20architecture%20of%20a%20GPU.png" alt="Basic architecture of a GPU.png"></p>
@@ -173,7 +249,7 @@ add<span class="token punctuation">[</span>grid<span class="token punctuation">]
 </code></pre><p>虽然这可能对并行计算没有很大的帮助（如elementwise）但是确实可以一定程度上简化复杂的计算。</p>
 <h2 id="vector-add-例子">Vector ADD 例子 </h2>
 <p>为了能够给后面的学习打一个好的基础，首先来具体分析一下Vector Add，以它为例子，入门Triton的基本语法。</p>
-<p>这也是Triton官方文档的tutorial中的第一个例子，这个例子比上面的代码在变量命名、注释方面更加详细(完整代码../triton-examples/00.vector-add.py)：</p>
+<p>这也是Triton官方文档的tutorial中的第一个例子，这个例子比上面的代码在变量命名、注释方面更加详细(完整代码…/triton-examples/00.vector-add.py)：</p>
 <h3 id="vector-add-kernel">Vector ADD Kernel </h3>
 <p>这个例子中涉及了使用triton编写kernel的几个要点：</p>
 <ol>
@@ -463,7 +539,7 @@ __global__ <span class="token keyword keyword-void">void</span> <span class="tok
 <p><img src="../.images/Normal%20DNN%20Stack.png" alt="Normal DNN Stack.png"></p>
 <p>Triton被用于实现自定义的op，在对上层引入，在kernel层经过转换后生成ptx代码</p>
 <p><img src="../.images/Triton%20as%20part%20of%20DNN%20Stack.png" alt="Triton as part of DNN Stack.png"></p>
-<h2 id="how-does-the-compiler-simplify-users-work">How does the compiler simplify user's work? </h2>
+<h2 id="how-does-the-compiler-simplify-users-work">How does the compiler simplify user’s work? </h2>
 <p>对于简化用户编码来说，Triton确实做到了，我们只需要使用简单的Python代码就能实现一个性能达到某些优化后版本的性能。Triton的一些列预置优化降低了开发kernel的门槛。</p>
 <p>但是，与之对应的，对于前端用户，它实际上是<strong>黑盒</strong>的，我们不知道Triton内部对这个kernel到底做了什么，只能知道它的功能是正确的。因此想要进一步去优化kernel需要深入进入Triton内部，已经分析PTX等IR来做，而不是通过我们实现的Python代码。</p>
 <p>它还有一个明显的缺点：tile size必须是2的幂，不支持切片（todo：这个要进一步去分析底层）</p>
@@ -476,6 +552,7 @@ __global__ <span class="token keyword keyword-void">void</span> <span class="tok
 <li><a href="https://www.youtube.com/watch?v=AtbnRIzpwho&amp;t=194s">Lightning Talk: Triton Compiler - Thomas Raoux, OpenAI</a>  低质量</li>
 <li><a href="https://isamu-website.medium.com/understanding-the-triton-tutorials-part-1-6191b59ba4c">Understanding the Triton Tutorials Part 1</a>  高质量</li>
 <li><a href="https://fkong.tech/posts/2023-04-23-triton-cuda/">Demystify OpenAI Triton</a> 高质量</li>
+<li><a href="https://youtu.be/Na9_2G6niMw?si=dAKKhEPkgiMkmvmU">Advance CUDA编程基础 (C++ programming) - Nvidia &amp; 字节内部分享</a> 必看</li>
 </ul>
 
       </div>
