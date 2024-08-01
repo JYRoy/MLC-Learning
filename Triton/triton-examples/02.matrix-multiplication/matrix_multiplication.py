@@ -255,7 +255,6 @@ def get_autotune_config():
     configs=get_autotune_config(),
     key=["M", "N", "K"],
 )
-
 @triton.jit
 def matmul_kernel(
     # Pointers to matrices
@@ -300,7 +299,7 @@ def matmul_kernel(
     )  # 计算实际的group size，因为当前group中不一定所有program都启动
     pid_m = first_pid_m + (
         (pid % num_pid_in_group) % group_size_m
-    )  # todo：pid_m和pid_n的区别还不清楚
+    )
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # ----------------------------------------------------------
@@ -385,21 +384,120 @@ def matmul(a, b, activation=""):
     return c
 
 
+@triton.autotune(
+    configs=get_autotune_config(),
+    key=["M", "N", "K"],
+)
+@triton.jit
+def row_major_matmul_kernel(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    # Matrix dimensions
+    M,
+    N,
+    K,
+    # The stride variables represent how much to increase the ptr by when moving by 1
+    # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
+    # by to get the element one row down (A has M rows).
+    stride_am,  # m维度+1的stride
+    stride_ak,  # k维度+1的stride
+    stride_bk,
+    stride_bn,  #
+    stride_cm,
+    stride_cn,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  #
+    GROUP_SIZE_M: tl.constexpr,  #
+    ACTIVATION: tl.constexpr,  #
+):
+    pid = tl.program_id(0)
+    block_num_m = (M + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    block_num_n = (N + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+
+    pid_m = pid // block_num_n
+    pid_n = pid % block_num_n
+
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    accumulator = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_SIZE_K):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k, other=0.0)
+        accumulator += tl.dot(a, b)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if ACTIVATION == "leaky_relu":
+        accumulator = leaky_relu(accumulator)
+    out = accumulator.to(tl.float16)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    out_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    tl.store(out_ptrs, out, mask=((offs_cm[:, None] < M) & (offs_cn[None, :] < N)))
+
+
+def row_major_matmul(a, b, activation=""):
+    # Check constraints.
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.is_contiguous(), "Matrix A must be contiguous"
+    M, K = a.shape
+    K, N = b.shape
+    # Allocates output.
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    # 1D launch kernel where each block gets its own program.
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    row_major_matmul_kernel[grid](
+        a,
+        b,
+        c,  #
+        M,
+        N,
+        K,  #
+        a.stride(0),
+        a.stride(1),  #
+        b.stride(0),
+        b.stride(1),  #
+        c.stride(0),
+        c.stride(1),  #
+        ACTIVATION=activation,  #
+    )
+    return c
+
+
 torch.manual_seed(0)
 a = torch.randn((512, 512), device="cuda", dtype=torch.float16)
 b = torch.randn((512, 512), device="cuda", dtype=torch.float16)
-triton_output = matmul(a, b)
+grouped_matmul_output = matmul(a, b)
+row_major_matmul_output = row_major_matmul(a, b)
 torch_output = torch.matmul(a, b)
-print(f"triton_output_with_fp16_inputs={triton_output}")
-print(f"torch_output_with_fp16_inputs={torch_output}")
+print(f"float16 grouped_matmul_output_with_fp16_inputs={grouped_matmul_output}")
+print(f"float16 row_major_triton_output_with_fp16_inputs={row_major_matmul_output}")
+print(f"float16 torch_output_with_fp16_inputs={torch_output}")
 # Bigger tolerance for AMD MI200 devices.
 # MI200 devices use reduced precision fp16 and bf16 and flush input and
 # output denormal values to zero. Detailed info is at: https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
 rtol = 1e-2 if is_hip_mi200() else 0
 if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=rtol):
-    print("✅ Triton and Torch match")
+    print("✅ float16 Triton and Torch match")
 else:
-    print("❌ Triton and Torch differ")
+    print("❌ float16 Triton and Torch differ")
+if torch.allclose(naive_triton_output, torch_output, atol=1e-2, rtol=rtol):
+    print("✅ float16 Naive Triton and Torch match")
+else:
+    print("❌ float16 Naive Triton and Torch differ")
 
 TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
 if TORCH_HAS_FP8 and is_cuda():
@@ -411,13 +509,20 @@ if TORCH_HAS_FP8 and is_cuda():
     b = b.T
     b = b.to(torch.float8_e5m2)
     triton_output = matmul(a, b)
+    naive_triton_output = row_major_matmul(a, b)
     torch_output = torch.matmul(a.to(torch.float16), b.to(torch.float16))
-    print(f"triton_output_with_fp8_inputs={triton_output}")
-    print(f"torch_output_with_fp8_inputs={torch_output}")
+    print(f"float8_e5m2 triton_output_with_fp8_inputs={triton_output}")
+    print(f"float8_e5m2 torch_output_with_fp8_inputs={torch_output}")
+    print(f"float8_e5m2 naive_torch_output_with_fp8_inputs={naive_triton_output}")
     if torch.allclose(triton_output, torch_output, atol=0.125, rtol=0):
-        print("✅ Triton and Torch match")
+        print("✅ float8_e5m2 Triton and Torch match")
     else:
-        print("❌ Triton and Torch differ")
+        print("❌ float8_e5m2 Triton and Torch differ")
+    if torch.allclose(naive_triton_output, torch_output, atol=0.125, rtol=0):
+        print("✅ float8_e5m2 Naive Triton and Torch match")
+    else:
+        print("❌ float8_e5m2 Triton and Torch differ")
+
 
 ref_lib = "cuBLAS" if is_cuda() else "rocBLAS"
 
@@ -429,16 +534,22 @@ for fp8_inputs in [False, True]:
         triton.testing.Benchmark(
             x_names=["M", "N", "K"],  # Argument names to use as an x-axis for the plot
             x_vals=[
-                128 * i for i in range(2, 33)
+                128 * i for i in range(2, 150, 2)
             ],  # Different possible values for `x_name`
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
             line_vals=(
-                ["triton"] if fp8_inputs else [ref_lib.lower(), "triton"]
+                ["triton", "naive_triton"]
+                if fp8_inputs
+                else [ref_lib.lower(), "triton", "naive_triton"]
             ),  # Label name for the lines
-            line_names=["Triton"] if fp8_inputs else [ref_lib, "Triton"],  # Line styles
-            styles=[("green", "-"), ("blue", "-")],
+            line_names=(
+                ["Triton", "Naive Triton"]
+                if fp8_inputs
+                else [ref_lib, "Triton", "Naive Triton"]
+            ),  # Line styles
+            styles=[("green", "-"), ("blue", "-"), ("red", "-")],
             ylabel="TFLOPS",  # Label name for the y-axis
             plot_name="matmul-performance-"
             + (
@@ -465,6 +576,10 @@ def benchmark(M, N, K, provider, fp8_inputs):
     if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: matmul(a, b), quantiles=quantiles
+        )
+    if provider == "naive_triton":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: row_major_matmul(a, b), quantiles=quantiles
         )
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
