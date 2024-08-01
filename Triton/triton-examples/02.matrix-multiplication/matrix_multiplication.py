@@ -299,7 +299,7 @@ def matmul_kernel(
     )  # 计算实际的group size，因为当前group中不一定所有program都启动
     pid_m = first_pid_m + (
         (pid % num_pid_in_group) % group_size_m
-    )
+    )  # todo：pid_m和pid_n的区别还不清楚
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # ----------------------------------------------------------
@@ -389,7 +389,7 @@ def matmul(a, b, activation=""):
     key=["M", "N", "K"],
 )
 @triton.jit
-def row_major_matmul_kernel(
+def naive_matmul_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -432,7 +432,7 @@ def row_major_matmul_kernel(
 
     for k in range(0, K, BLOCK_SIZE_K):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -447,7 +447,7 @@ def row_major_matmul_kernel(
     tl.store(out_ptrs, out, mask=((offs_cm[:, None] < M) & (offs_cn[None, :] < N)))
 
 
-def row_major_matmul(a, b, activation=""):
+def native_matmul_host(a, b, activation=""):
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
@@ -459,7 +459,7 @@ def row_major_matmul(a, b, activation=""):
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    row_major_matmul_kernel[grid](
+    naive_matmul_kernel[grid](
         a,
         b,
         c,  #
@@ -480,11 +480,11 @@ def row_major_matmul(a, b, activation=""):
 torch.manual_seed(0)
 a = torch.randn((512, 512), device="cuda", dtype=torch.float16)
 b = torch.randn((512, 512), device="cuda", dtype=torch.float16)
-grouped_matmul_output = matmul(a, b)
-row_major_matmul_output = row_major_matmul(a, b)
+triton_output = matmul(a, b)
+naive_triton_output = native_matmul_host(a, b)
 torch_output = torch.matmul(a, b)
-print(f"float16 grouped_matmul_output_with_fp16_inputs={grouped_matmul_output}")
-print(f"float16 row_major_triton_output_with_fp16_inputs={row_major_matmul_output}")
+print(f"float16 triton_output_with_fp16_inputs={triton_output}")
+print(f"float16 naive_triton_output_with_fp16_inputs={naive_triton_output}")
 print(f"float16 torch_output_with_fp16_inputs={torch_output}")
 # Bigger tolerance for AMD MI200 devices.
 # MI200 devices use reduced precision fp16 and bf16 and flush input and
@@ -509,7 +509,7 @@ if TORCH_HAS_FP8 and is_cuda():
     b = b.T
     b = b.to(torch.float8_e5m2)
     triton_output = matmul(a, b)
-    naive_triton_output = row_major_matmul(a, b)
+    naive_triton_output = native_matmul_host(a, b)
     torch_output = torch.matmul(a.to(torch.float16), b.to(torch.float16))
     print(f"float8_e5m2 triton_output_with_fp8_inputs={triton_output}")
     print(f"float8_e5m2 torch_output_with_fp8_inputs={torch_output}")
@@ -579,7 +579,7 @@ def benchmark(M, N, K, provider, fp8_inputs):
         )
     if provider == "naive_triton":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: row_major_matmul(a, b), quantiles=quantiles
+            lambda: native_matmul_host(a, b), quantiles=quantiles
         )
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
