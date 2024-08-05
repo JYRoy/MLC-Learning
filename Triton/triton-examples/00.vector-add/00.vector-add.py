@@ -12,7 +12,9 @@ import torch
 import triton
 import triton.language as tl
 
+import math
 
+@triton.heuristics(values={'BLOCK_SIZE': lambda args: 2 ** int(math.ceil(math.log2(args["n_elements"])))})
 @triton.jit
 def add_kernel(
     x_ptr,  # *Pointer* to first input vector.
