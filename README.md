@@ -18,6 +18,17 @@
 
 以了解LLVM IR、LLVM编译流程和学会使用LLVM开发深度学习编译器为目标。
 
+### [MLIR](./MLIR/)
+
+跟随MLIR官方的教程 (Toy Tutorial)[https://mlir.llvm.org/docs/Tutorials/Toy/]，实现一个toy language
+
+主要学习：
+
+1. AST方式
+2. Dialect定义方式
+3. Pattern Rewrite System
+4. Transform、lowering方式
+
 ### [Triton](./Triton/)
 
 主要学习：
