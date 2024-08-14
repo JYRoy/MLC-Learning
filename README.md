@@ -20,7 +20,7 @@
 
 ### [MLIR](./MLIR/)
 
-跟随MLIR官方的教程 (Toy Tutorial)[https://mlir.llvm.org/docs/Tutorials/Toy/]，实现一个toy language
+跟随MLIR官方的教程 [Toy Tutorial](https://mlir.llvm.org/docs/Tutorials/Toy/)，实现一个toy language
 
 主要学习：
 
